@@ -1,10 +1,14 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+mod drg_modio;
+mod tags;
+mod swiss_dev;
+
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
-use mockall::{automock, predicate::*};
+use mockall::{predicate::*};
 
 use anyhow::{bail, Context, Result};
 use reqwest::{Request, Response};
@@ -13,10 +17,11 @@ use serde::{Deserialize, Serialize};
 use task_local_extensions::Extensions;
 use tokio::sync::mpsc::Sender;
 use tracing::{info, warn};
+use drg_modio::DrgModio;
 
 use super::{
-    ApprovalStatus, BlobCache, BlobRef, FetchProgress, ModInfo, ModProvider, ModProviderCache,
-    ModResolution, ModResponse, ModSpecification, ModioTags, ProviderCache, RequiredStatus,
+    BlobCache, BlobRef, FetchProgress, ModInfo, ModProvider,
+    ModProviderCache, ModResolution, ModResponse, ModSpecification, ProviderCache,
 };
 
 lazy_static::lazy_static! {
@@ -25,6 +30,7 @@ lazy_static::lazy_static! {
 
 const MODIO_DRG_ID: u32 = 2475;
 const MODIO_PROVIDER_ID: &str = "modio";
+const SWISS_DEV_PROVIDER_ID: &str = "swissdev";
 
 inventory::submit! {
     super::ProviderFactory {
@@ -39,6 +45,15 @@ inventory::submit! {
                 link: Some("https://mod.io/me/access"),
             },
         ]
+    }
+}
+
+inventory::submit! {
+    super::ProviderFactory {
+        id: SWISS_DEV_PROVIDER_ID,
+        new: ModioProvider::<swiss_dev::SwissDevModio>::new_provider,
+        can_provide: |url| RE_MOD.is_match(url),
+        parameters: &[]
     }
 }
 
@@ -182,172 +197,6 @@ impl Middleware for LoggingMiddleware {
     }
 }
 
-#[cfg_attr(test, automock)]
-#[async_trait::async_trait]
-pub trait DrgModio: Sync + Send {
-    fn with_parameters(parameters: &HashMap<String, String>) -> Result<Self>
-    where
-        Self: Sized;
-    async fn check(&self) -> Result<()>;
-    async fn fetch_mod(&self, id: u32) -> Result<ModioMod>;
-    async fn fetch_files(&self, mod_id: u32) -> Result<ModioMod>;
-    async fn fetch_file(&self, mod_id: u32, modfile_id: u32) -> Result<modio::files::File>;
-    async fn fetch_dependencies(&self, mod_id: u32) -> Result<Vec<u32>>;
-    async fn fetch_mods_by_name(&self, name_id: &str) -> Result<Vec<ModioModResponse>>;
-    async fn fetch_mods_by_ids(&self, filter_ids: Vec<u32>) -> Result<Vec<modio::mods::Mod>>;
-    async fn fetch_mod_updates_since(
-        &self,
-        mod_ids: Vec<u32>,
-        last_update: u64,
-    ) -> Result<HashSet<u32>>;
-    fn download<A: 'static>(&self, action: A) -> modio::download::Downloader
-    where
-        modio::download::DownloadAction: From<A>;
-}
-
-#[async_trait::async_trait]
-impl DrgModio for modio::Modio {
-    fn with_parameters(parameters: &HashMap<String, String>) -> Result<Self> {
-        let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
-            .with::<LoggingMiddleware>(Default::default())
-            .build();
-        let modio = modio::Modio::new(
-            modio::Credentials::with_token(
-                "".to_owned(), // TODO patch modio to not use API key at all
-                parameters
-                    .get("oauth")
-                    .context("missing OAuth token param")?,
-            ),
-            client,
-        )?;
-
-        Ok(modio)
-    }
-    async fn check(&self) -> Result<()> {
-        use modio::filter::Eq;
-        use modio::mods::filters::Id;
-
-        self.game(MODIO_DRG_ID)
-            .mods()
-            .search(Id::eq(0))
-            .collect()
-            .await?;
-        Ok(())
-    }
-    async fn fetch_mod(&self, id: u32) -> Result<ModioMod> {
-        use modio::filter::NotEq;
-        use modio::mods::filters::Id;
-
-        let files = self
-            .game(MODIO_DRG_ID)
-            .mod_(id)
-            .files()
-            .search(Id::ne(0))
-            .collect()
-            .await?;
-        let mod_ = self.game(MODIO_DRG_ID).mod_(id).get().await?;
-
-        Ok(ModioMod::new(mod_, files))
-    }
-    async fn fetch_files(&self, mod_id: u32) -> Result<ModioMod> {
-        use modio::filter::NotEq;
-        use modio::mods::filters::Id;
-
-        let files = self
-            .game(MODIO_DRG_ID)
-            .mod_(mod_id)
-            .files()
-            .search(Id::ne(0))
-            .collect()
-            .await?;
-        let mod_ = self.game(MODIO_DRG_ID).mod_(mod_id).get().await?;
-
-        Ok(ModioMod::new(mod_, files))
-    }
-    async fn fetch_file(&self, mod_id: u32, modfile_id: u32) -> Result<modio::files::File> {
-        Ok(self
-            .game(MODIO_DRG_ID)
-            .mod_(mod_id)
-            .file(modfile_id)
-            .get()
-            .await?)
-    }
-    async fn fetch_dependencies(&self, mod_id: u32) -> Result<Vec<u32>> {
-        Ok(self
-            .game(MODIO_DRG_ID)
-            .mod_(mod_id)
-            .dependencies()
-            .list()
-            .await?
-            .into_iter()
-            .map(|d| d.mod_id)
-            .collect::<Vec<_>>())
-    }
-    async fn fetch_mods_by_name(&self, name_id: &str) -> Result<Vec<ModioModResponse>> {
-        use modio::filter::{Eq, In};
-        use modio::mods::filters::{NameId, Visible};
-
-        let filter = NameId::eq(name_id).and(Visible::_in(vec![0, 1]));
-        Ok(self
-            .game(MODIO_DRG_ID)
-            .mods()
-            .search(filter)
-            .collect()
-            .await?
-            .into_iter()
-            .map(|m| m.into())
-            .collect())
-    }
-    async fn fetch_mods_by_ids(&self, filter_ids: Vec<u32>) -> Result<Vec<modio::mods::Mod>> {
-        use modio::filter::In;
-        use modio::mods::filters::Id;
-
-        let filter = Id::_in(filter_ids);
-
-        Ok(self
-            .game(MODIO_DRG_ID)
-            .mods()
-            .search(filter)
-            .collect()
-            .await?)
-    }
-    async fn fetch_mod_updates_since(
-        &self,
-        mod_ids: Vec<u32>,
-        last_update: u64,
-    ) -> Result<HashSet<u32>> {
-        use modio::filter::Cmp;
-        use modio::filter::In;
-        use modio::filter::NotIn;
-
-        use modio::mods::filters::events::EventType;
-        use modio::mods::filters::events::ModId;
-        use modio::mods::filters::DateAdded;
-        use modio::mods::EventType as EventTypes;
-
-        let events = self
-            .game(MODIO_DRG_ID)
-            .mods()
-            .events(
-                EventType::not_in(vec![
-                    EventTypes::ModCommentAdded,
-                    EventTypes::ModCommentDeleted,
-                ])
-                .and(ModId::_in(mod_ids))
-                .and(DateAdded::gt(last_update)),
-            )
-            .collect()
-            .await?;
-        Ok(events.iter().map(|e| e.mod_id).collect::<HashSet<_>>())
-    }
-    fn download<A>(&self, action: A) -> modio::download::Downloader
-    where
-        modio::download::DownloadAction: From<A>,
-    {
-        self.download(action)
-    }
-}
-
 #[async_trait::async_trait]
 impl<M: DrgModio + Send + Sync> ModProvider for ModioProvider<M> {
     async fn resolve_mod(
@@ -480,7 +329,7 @@ impl<M: DrgModio + Send + Sync> ModProvider for ModioProvider<M> {
                 resolution: ModResolution::resolvable(url.to_owned()),
                 suggested_require: mod_.tags.contains("RequiredByAll"),
                 suggested_dependencies: deps,
-                modio_tags: Some(process_modio_tags(&mod_.tags)),
+                modio_tags: Some(tags::process_modio_tags(&mod_.tags)),
                 modio_id: Some(mod_id),
             }))
         } else if let Some(mod_id) = captures.name("mod_id") {
@@ -791,7 +640,7 @@ impl<M: DrgModio + Send + Sync> ModProvider for ModioProvider<M> {
             resolution: ModResolution::resolvable(url.to_owned()),
             suggested_require: mod_.tags.contains("RequiredByAll"),
             suggested_dependencies: deps,
-            modio_tags: Some(process_modio_tags(&mod_.tags)),
+            modio_tags: Some(tags::process_modio_tags(&mod_.tags)),
             modio_id: Some(mod_id),
         })
     }
@@ -842,49 +691,13 @@ impl<M: DrgModio + Send + Sync> ModProvider for ModioProvider<M> {
     }
 }
 
-fn process_modio_tags(set: &HashSet<String>) -> ModioTags {
-    let qol = set.contains("QoL");
-    let gameplay = set.contains("Gameplay");
-    let audio = set.contains("Audio");
-    let visual = set.contains("Visual");
-    let framework = set.contains("Framework");
-    let required_status = if set.contains("RequiredByAll") {
-        RequiredStatus::RequiredByAll
-    } else {
-        RequiredStatus::Optional
-    };
-    let approval_status = if set.contains("Verified") || set.contains("Auto-Verified") {
-        ApprovalStatus::Verified
-    } else if set.contains("Approved") {
-        ApprovalStatus::Approved
-    } else {
-        ApprovalStatus::Sandbox
-    };
-    // Basic heuristic to collect all the tags which begin with a number, like `1.38`.
-    let versions = set
-        .iter()
-        .filter(|i| i.starts_with(char::is_numeric))
-        .cloned()
-        .collect::<BTreeSet<String>>();
-
-    ModioTags {
-        qol,
-        gameplay,
-        audio,
-        visual,
-        framework,
-        versions,
-        required_status,
-        approval_status,
-    }
-}
-
 #[cfg(test)]
 mod test {
     use std::sync::{OnceLock, RwLock};
 
     use crate::{providers::VersionAnnotatedCache, state::config::ConfigWrapper};
 
+    use drg_modio::MockDrgModio;
     use super::*;
 
     #[tokio::test]
